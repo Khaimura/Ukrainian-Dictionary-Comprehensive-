@@ -1,0 +1,4 @@
+*.aff
+*.dic
+__pycache__/
+*.tmp
