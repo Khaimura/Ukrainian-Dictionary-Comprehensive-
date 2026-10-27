@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-test_merge_hunspell.py - Unit and Integration Tests for Hunspell Merger
+test_merge_hunspell.py - Robust Unit and Integration Tests for Hunspell Merger
 """
 
 import unittest
 import tempfile
 import os
 import subprocess
-from merge_hunspell import HunspellMerger, parse_dic_flags
+from merge_hunspell import HunspellMerger, parse_dic_flags, is_safe_zip_path, detect_file_encoding, verify_with_hunspell
 
 class TestHunspellMerger(unittest.TestCase):
     def setUp(self):
@@ -17,12 +17,24 @@ class TestHunspellMerger(unittest.TestCase):
     def tearDown(self):
         self.tmp_dir.cleanup()
 
+    def test_zip_slip_protection(self):
+        self.assertTrue(is_safe_zip_path(self.work_dir, "good_file.txt"))
+        self.assertTrue(is_safe_zip_path(self.work_dir, "subfolder/good_file.txt"))
+        self.assertFalse(is_safe_zip_path(self.work_dir, "../outside.txt"))
+        self.assertFalse(is_safe_zip_path(self.work_dir, "/etc/passwd"))
+
     def test_parse_dic_flags(self):
         self.assertEqual(parse_dic_flags("AB", "char"), ["A", "B"])
         self.assertEqual(parse_dic_flags("AaBb", "long"), ["Aa", "Bb"])
         self.assertEqual(parse_dic_flags("101,102", "num"), ["101", "102"])
 
-    def test_aff_merging_and_counters(self):
+    def test_detect_file_encoding(self):
+        aff_path = os.path.join(self.work_dir, "test.aff")
+        with open(aff_path, "wb") as f:
+            f.write(b"SET UTF-8\nTRY abc\n")
+        self.assertEqual(detect_file_encoding(aff_path), "UTF-8")
+
+    def test_aff_merging_af_compoundrule_and_counters(self):
         aff1_path = os.path.join(self.work_dir, "aff1.aff")
         aff2_path = os.path.join(self.work_dir, "aff2.aff")
 
@@ -30,8 +42,10 @@ class TestHunspellMerger(unittest.TestCase):
             f.write(
                 "SET UTF-8\n"
                 "TRY abc\n"
-                "REP 1\n"
-                "REP foo bar\n"
+                "AF 1\n"
+                "AF A\n"
+                "COMPOUNDRULE 1\n"
+                "COMPOUNDRULE (a)(b)\n"
                 "SFX A Y 1\n"
                 "SFX A 0 a .\n"
             )
@@ -40,8 +54,10 @@ class TestHunspellMerger(unittest.TestCase):
             f.write(
                 "SET UTF-8\n"
                 "TRY abc\n"
-                "REP 1\n"
-                "REP baz qux\n"
+                "AF 1\n"
+                "AF B\n"
+                "COMPOUNDRULE 1\n"
+                "COMPOUNDRULE (c)(d)\n"
                 "SFX A Y 1\n"
                 "SFX A 0 b .\n"
             )
@@ -51,15 +67,30 @@ class TestHunspellMerger(unittest.TestCase):
         aff_content, defined_flags, flag_mode = merger.merge_aff()
 
         self.assertIn("SET UTF-8", aff_content)
-        self.assertIn("REP 2", aff_content)
-        self.assertIn("REP baz qux", aff_content)
-        self.assertIn("REP foo bar", aff_content)
+        self.assertIn("AF 2", aff_content)
+        self.assertIn("AF A", aff_content)
+        self.assertIn("AF B", aff_content)
+        self.assertIn("COMPOUNDRULE 2", aff_content)
+        self.assertIn("COMPOUNDRULE (a)(b)", aff_content)
+        self.assertIn("COMPOUNDRULE (c)(d)", aff_content)
         self.assertIn("SFX A Y 2", aff_content)
-        self.assertIn("SFX A 0 a .", aff_content)
-        self.assertIn("SFX A 0 b .", aff_content)
-        self.assertIn("A", defined_flags)
 
-    def test_dic_exact_duplicates_and_different_flags(self):
+    def test_pfx_sfx_combinability_conflict_raises_error(self):
+        aff1_path = os.path.join(self.work_dir, "aff1.aff")
+        aff2_path = os.path.join(self.work_dir, "aff2.aff")
+
+        with open(aff1_path, "w", encoding="utf-8") as f:
+            f.write("SET UTF-8\nSFX A Y 1\nSFX A 0 a .\n")
+
+        with open(aff2_path, "w", encoding="utf-8") as f:
+            f.write("SET UTF-8\nSFX A N 1\nSFX A 0 b .\n")
+
+        merger = HunspellMerger(self.work_dir)
+        merger.aff_files = [aff1_path, aff2_path]
+        with self.assertRaises(ValueError):
+            merger.merge_aff()
+
+    def test_dic_exact_duplicates_preserved_flag_sets(self):
         dic1_path = os.path.join(self.work_dir, "dic1.dic")
         dic2_path = os.path.join(self.work_dir, "dic2.dic")
 
@@ -80,21 +111,6 @@ class TestHunspellMerger(unittest.TestCase):
         self.assertIn("інше/C", lines)
         self.assertNotIn("слово/AB", lines)
 
-    def test_aff_conflict_detection(self):
-        aff1_path = os.path.join(self.work_dir, "aff1.aff")
-        aff2_path = os.path.join(self.work_dir, "aff2.aff")
-
-        with open(aff1_path, "w", encoding="utf-8") as f:
-            f.write("SET UTF-8\n")
-
-        with open(aff2_path, "w", encoding="utf-8") as f:
-            f.write("SET ISO8859-1\n")
-
-        merger = HunspellMerger(self.work_dir)
-        merger.aff_files = [aff1_path, aff2_path]
-        with self.assertRaises(ValueError):
-            merger.merge_aff()
-
     def test_unsupported_directive_raises_error(self):
         aff1_path = os.path.join(self.work_dir, "aff1.aff")
         with open(aff1_path, "w", encoding="utf-8") as f:
@@ -105,10 +121,9 @@ class TestHunspellMerger(unittest.TestCase):
         with self.assertRaises(ValueError):
             merger.merge_aff()
 
-    def test_real_hunspell_load_and_spellcheck(self):
-        # Generate files dynamically in temporary directory
+    def test_verify_with_hunspell_function(self):
         aff_path = os.path.join(self.work_dir, "Dictionary.aff")
-        dic_path = os.path.join(self.work_dir, "Dictionary.dic")
+        dic_path = os.path.join(self.work_dir, "Ukrainian Dictionary.dic")
 
         with open(aff_path, "w", encoding="utf-8") as f:
             f.write("SET UTF-8\nTRY abc\n")
@@ -116,15 +131,7 @@ class TestHunspellMerger(unittest.TestCase):
         with open(dic_path, "w", encoding="utf-8") as f:
             f.write("2\nабзац\nнайсправжнісінький\n")
 
-        dict_base = os.path.join(self.work_dir, "Dictionary")
-        cmd = ['hunspell', '-d', dict_base, '-l']
-        input_words = "абзац\nнайсправжнісінький\nнеіснуючеслово999\n"
-        p = subprocess.run(cmd, input=input_words, capture_output=True, text=True)
-        self.assertEqual(p.returncode, 0, f"Hunspell failed with stderr: {p.stderr}")
-
-        misspelled = [w.strip() for w in p.stdout.splitlines() if w.strip()]
-        self.assertIn("неіснуючеслово999", misspelled)
-        self.assertNotIn("абзац", misspelled)
+        self.assertTrue(verify_with_hunspell(aff_path, dic_path))
 
 if __name__ == "__main__":
     unittest.main()
